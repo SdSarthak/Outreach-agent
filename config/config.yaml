@@ -1,0 +1,54 @@
+project:
+  name: "AI Outreach Agent"
+  version: "1.0.0"
+  description: "Multi-agent AI system for automated customer outreach"
+
+agents:
+  insight_agent:
+    name: "Insight Agent"
+    role: "Strategic Call Guidance Provider"
+    goal: "Generate personalized call guidance and strategic insights"
+    backstory: "Expert analyst specializing in customer engagement and communication strategies"
+    
+  call_agent:
+    name: "Call Agent"
+    role: "Voice Communication Executor"
+    goal: "Execute professional voice calls with personalized context"
+    backstory: "Experienced communication specialist managing outbound calls"
+    
+  decision_agent:
+    name: "Decision Agent"
+    role: "Call Monitoring and Follow-up Coordinator"
+    goal: "Monitor call outcomes and recommend follow-up actions"
+    backstory: "Strategic analyst monitoring customer interactions and determining next steps"
+    
+  email_agent:
+    name: "Email Agent"
+    role: "Follow-up Email Composer"
+    goal: "Draft and send personalized follow-up emails"
+    backstory: "Professional communicator crafting compelling follow-up messages"
+
+integrations:
+  elevenlabs:
+    voice_id: "21m00Tcm4TlvDq8ikWAM"  # Default professional voice
+    model: "eleven_turbo_v2"
+    max_characters: 1000
+    
+  twilio:
+    region: "us-east-1"
+    timeout: 300
+    
+  gmail:
+    sender_name: "AI Outreach Agent"
+    signature: "Best regards,\nAI Outreach Team"
+
+database:
+  type: "sqlite"
+  echo: false
+  pool_size: 5
+  max_overflow: 10
+
+logging:
+  level: "INFO"
+  format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+  file: "logs/outreach_agent.log"
