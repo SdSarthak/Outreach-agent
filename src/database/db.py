@@ -1,31 +1,73 @@
+"""Database engine and session management."""
+
+import logging
+from contextlib import contextmanager
+
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
-import os
+
+from src.config import get_settings
+
 from .models import Base
+
+logger = logging.getLogger(__name__)
+
 
 class DatabaseManager:
     """Database connection and session management"""
-    
-    def __init__(self, database_url: str = None):
-        if database_url is None:
-            database_url = os.getenv("DATABASE_URL", "sqlite:///outreach_agent.db")
-        
-        self.engine = create_engine(
-            database_url,
-            echo=os.getenv("DB_ECHO", "false").lower() == "true",
-            connect_args={"check_same_thread": False} if "sqlite" in database_url else {}
+
+    def __init__(self, database_url: str = None, echo: bool = None):
+        settings = get_settings()
+
+        self.database_url = database_url or settings.database_url
+        is_sqlite = self.database_url.startswith("sqlite")
+
+        engine_kwargs = {
+            "echo": settings.db_echo if echo is None else echo,
+            "future": True,
+        }
+        if is_sqlite:
+            engine_kwargs["connect_args"] = {"check_same_thread": False}
+        else:
+            database_cfg = settings.section("database")
+            engine_kwargs["pool_size"] = int(database_cfg.get("pool_size", 5))
+            engine_kwargs["max_overflow"] = int(database_cfg.get("max_overflow", 10))
+            engine_kwargs["pool_pre_ping"] = True
+
+        self.engine = create_engine(self.database_url, **engine_kwargs)
+        self.SessionLocal = sessionmaker(
+            autocommit=False, autoflush=False, bind=self.engine, expire_on_commit=False
         )
-        self.SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=self.engine)
-    
+
     def init_db(self):
-        """Initialize database tables"""
+        """Create any tables that do not exist yet."""
         Base.metadata.create_all(bind=self.engine)
-        print("Database initialized successfully")
-    
+        logger.info("Database initialized (%s)", self.database_url)
+        return True
+
+    def drop_all(self):
+        """Drop every table. Used by `seed_data.py --reset` and by tests."""
+        Base.metadata.drop_all(bind=self.engine)
+        logger.info("All tables dropped (%s)", self.database_url)
+        return True
+
     def get_session(self):
-        """Get a new database session"""
+        """Get a new database session."""
         return self.SessionLocal()
-    
+
+    @contextmanager
+    def session_scope(self):
+        """Transactional scope: commits on success, rolls back on error."""
+        session = self.SessionLocal()
+        try:
+            yield session
+            session.commit()
+        except Exception:
+            session.rollback()
+            raise
+        finally:
+            session.close()
+
     def close(self):
-        """Close database connection"""
+        """Dispose of the connection pool."""
         self.engine.dispose()

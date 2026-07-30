@@ -2,25 +2,31 @@
 from .db import DatabaseManager
 from .models import (
     Base,
-    Customer,
-    Enrollment,
-    Engagement,
-    Feedback,
     CallRecord,
-    EmailRecord,
+    CallStatus,
     Campaign,
-    OutreachMetrics
+    Customer,
+    EmailRecord,
+    EmailStatus,
+    Engagement,
+    Enrollment,
+    Feedback,
+    OutreachMetrics,
 )
+from .repository import OutreachRepository
 
 __all__ = [
     "DatabaseManager",
+    "OutreachRepository",
     "Base",
     "Customer",
     "Enrollment",
     "Engagement",
     "Feedback",
     "CallRecord",
+    "CallStatus",
     "EmailRecord",
+    "EmailStatus",
     "Campaign",
     "OutreachMetrics",
 ]
