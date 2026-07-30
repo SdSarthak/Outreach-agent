@@ -1,49 +1,55 @@
-from crewai import Agent, Task, Crew
-from crewai.tools import BaseTool
+"""Agent that turns customer context into strategic call guidance."""
+
 import logging
+
+from src.agents.base import build_agent
 
 logger = logging.getLogger(__name__)
 
+
 class InsightAgent:
     """Agent for generating strategic call guidance and insights"""
-    
+
     def __init__(self):
-        self.agent = Agent(
+        self.agent = build_agent(
+            "insight_agent",
             role="Strategic Call Guidance Provider",
             goal="Generate personalized call guidance and strategic insights based on customer data",
-            backstory="Expert analyst specializing in customer engagement and communication strategies. "
-                     "You analyze customer data to glean insights and create tailored talking points.",
-            verbose=True
+            backstory=(
+                "Expert analyst specializing in customer engagement and communication "
+                "strategies. You analyze customer data to glean insights and create "
+                "tailored talking points."
+            ),
         )
-    
+
     def generate_call_guidance(self, customer_context: dict) -> dict:
         """
         Generate guidance for an outbound call
-        
+
         Args:
             customer_context: Customer data and engagement history
-            
+
         Returns:
             Call guidance with talking points and recommendations
         """
-        try:
-            guidance = {
-                "customer_id": customer_context.get("customer_id"),
-                "customer_name": customer_context.get("name"),
-                "company": customer_context.get("company"),
-                "key_talking_points": self._generate_talking_points(customer_context),
-                "tone": self._determine_tone(customer_context),
-                "recommended_actions": self._recommend_actions(customer_context),
-                "engagement_strategy": self._strategy_for_engagement(customer_context),
-                "potential_objections": self._identify_objections(customer_context),
-                "next_steps": self._plan_next_steps(customer_context)
-            }
-            
-            logger.info(f"Generated guidance for customer {customer_context.get('customer_id')}")
-            return guidance
-        except Exception as e:
-            logger.error(f"Error generating call guidance: {str(e)}")
+        if not customer_context:
+            logger.warning("Cannot generate guidance without customer context")
             return None
+
+        guidance = {
+            "customer_id": customer_context.get("customer_id"),
+            "customer_name": customer_context.get("name"),
+            "company": customer_context.get("company"),
+            "key_talking_points": self._generate_talking_points(customer_context),
+            "tone": self._determine_tone(customer_context),
+            "recommended_actions": self._recommend_actions(customer_context),
+            "engagement_strategy": self._strategy_for_engagement(customer_context),
+            "potential_objections": self._identify_objections(customer_context),
+            "next_steps": self._plan_next_steps(customer_context),
+        }
+
+        logger.info("Generated guidance for customer %s", customer_context.get("customer_id"))
+        return guidance
     
     def _generate_talking_points(self, context: dict) -> list:
         """Generate personalized talking points"""
@@ -58,9 +64,9 @@ class InsightAgent:
             points.append("Leverage high engagement history to deepen relationship")
         
         # Product/service points
-        if context.get("enrollments"):
-            products = [e.get("product") for e in context["enrollments"]]
-            points.append(f"Reference their current products: {', '.join(products)}")
+        products = [e.get("product") for e in context.get("enrollments") or [] if e.get("product")]
+        if products:
+            points.append(f"Reference their current products: {', '.join(sorted(set(products)))}")
         
         # Feedback-based points
         if context.get("feedback_history"):
@@ -91,7 +97,8 @@ class InsightAgent:
         if not context.get("enrollments"):
             actions.append("Introduce key products/services")
         
-        recent_feedback = context.get("feedback_history", [{}])[0]
+        feedback_history = context.get("feedback_history") or []
+        recent_feedback = feedback_history[0] if feedback_history else {}
         if recent_feedback.get("sentiment") == "negative":
             actions.append("Address concerns and offer solutions")
         
@@ -118,10 +125,12 @@ class InsightAgent:
         """Identify potential objections"""
         objections = []
         
-        feedback = context.get("feedback_history", [])
-        for f in feedback:
+        # `CustomerDataWorkflow` exposes the feedback body under "text".
+        for f in context.get("feedback_history") or []:
             if f.get("sentiment") == "negative":
-                objections.append(f"Previous concern: {f.get('feedback_text')}")
+                concern = f.get("text") or f.get("feedback_text")
+                if concern:
+                    objections.append(f"Previous concern: {concern}")
         
         if not context.get("enrollments"):
             objections.append("Potential objection: Not familiar with our solutions")
