@@ -1,72 +1,97 @@
-from src.database import DatabaseManager
-from src.agents import InsightAgent, CallAgent, DecisionAgent, EmailAgent
-from src.utils import CustomerDataWorkflow, AnalyticsManager, setup_logging
-from src.integrations import ElevenLabsIntegration, TwilioIntegration, GmailIntegration
+"""End-to-end orchestration of the outreach pipeline.
+
+For every customer the orchestrator runs the full crew:
+
+    context -> guidance -> call -> analysis -> follow-up email -> metrics
+
+Every step is persisted, so a campaign can be inspected afterwards through
+:class:`~src.utils.analytics.AnalyticsManager`.
+"""
+
 import logging
-import yaml
-import os
+from datetime import datetime
+
+from src.agents import CallAgent, DecisionAgent, EmailAgent, InsightAgent
+from src.config import get_settings
+from src.database import CallStatus, DatabaseManager, OutreachRepository
+from src.integrations import ElevenLabsIntegration, GmailIntegration, TwilioIntegration
+from src.utils import AnalyticsManager, CustomerDataWorkflow, setup_logging
 
 logger = logging.getLogger(__name__)
 
+
 class OutreachOrchestrator:
     """Main orchestration for the AI Outreach Agent system"""
-    
-    def __init__(self, config_path: str = "config/config.yaml"):
+
+    def __init__(self, config_path: str = None, db_manager: DatabaseManager = None):
+        self.settings = get_settings(config_path) if config_path else get_settings()
         self.logger = setup_logging()
-        self.config = self._load_config(config_path)
-        
-        # Initialize database
-        self.db_manager = DatabaseManager()
+        self.config = self.settings.raw_config
+
+        self.db_manager = db_manager or DatabaseManager()
         self.db_manager.init_db()
-        
-        # Initialize agents
+        self.repository = OutreachRepository(self.db_manager)
+
+        # Integrations are created once and shared with the agents so a single
+        # HTTP session and Gmail credential is reused across the campaign.
+        self.elevenlabs = ElevenLabsIntegration(self.settings)
+        self.twilio = TwilioIntegration(self.settings)
+        self.gmail = GmailIntegration(self.settings)
+
         self.insight_agent = InsightAgent()
-        self.call_agent = CallAgent()
-        self.decision_agent = DecisionAgent(self.db_manager)
-        self.email_agent = EmailAgent(self.db_manager)
-        
-        # Initialize utilities
+        self.call_agent = CallAgent(
+            elevenlabs=self.elevenlabs, twilio=self.twilio, settings=self.settings
+        )
+        self.decision_agent = DecisionAgent(self.db_manager, repository=self.repository)
+        self.email_agent = EmailAgent(
+            self.db_manager, gmail=self.gmail, repository=self.repository, settings=self.settings
+        )
+
         self.customer_workflow = CustomerDataWorkflow(self.db_manager)
         self.analytics = AnalyticsManager(self.db_manager)
-        
-        # Initialize integrations
-        self.elevenlabs = ElevenLabsIntegration()
-        self.twilio = TwilioIntegration()
-        self.gmail = GmailIntegration()
-        
+
+        if self.settings.dry_run:
+            self.logger.warning("DRY_RUN is enabled - no real calls or emails will be sent")
+        missing = self.settings.missing_credentials()
+        if missing:
+            self.logger.info("Integrations running in simulated mode: %s", ", ".join(missing))
+
         self.logger.info("Outreach Orchestrator initialized")
-    
-    def _load_config(self, config_path: str) -> dict:
-        """Load configuration from YAML"""
-        try:
-            with open(config_path, 'r') as f:
-                config = yaml.safe_load(f)
-            self.logger.info(f"Configuration loaded from {config_path}")
-            return config
-        except Exception as e:
-            self.logger.error(f"Error loading config: {str(e)}")
-            return {}
-    
-    def execute_outreach_workflow(self, customer_ids: list, campaign_name: str) -> dict:
-        """
-        Execute complete outreach workflow for customers
-        
+
+    # --------------------------------------------------------------- campaigns
+    def execute_outreach_workflow(self, customer_ids: list = None, campaign_name: str = None) -> dict:
+        """Run the outreach pipeline across a set of customers.
+
         Args:
-            customer_ids: List of customer IDs to contact
-            campaign_name: Name of the outreach campaign
-            
+            customer_ids: Customers to contact. When omitted, every active
+                customer in the database is contacted.
+            campaign_name: Name recorded against the campaign.
+
         Returns:
-            Campaign results summary
+            A results summary, or None when the campaign could not start.
         """
         try:
-            self.logger.info(f"Starting outreach workflow for {len(customer_ids)} customers")
-            
-            # Create campaign
+            if not customer_ids:
+                customer_ids = self.repository.customer_ids()
+                self.logger.info("No customer ids given - using %s active customers", len(customer_ids))
+
+            if not customer_ids:
+                self.logger.warning("No customers to contact - seed the database first")
+                return None
+
+            campaign_name = campaign_name or f"Outreach {datetime.utcnow():%Y-%m-%d %H:%M}"
             campaign_id = self.analytics.create_campaign(
                 campaign_name,
-                description=f"Outreach campaign for {len(customer_ids)} customers"
+                description=f"Outreach campaign for {len(customer_ids)} customers",
             )
-            
+
+            self.logger.info(
+                "Starting campaign '%s' (%s) for %s customers",
+                campaign_name,
+                campaign_id,
+                len(customer_ids),
+            )
+
             results = {
                 "campaign_id": campaign_id,
                 "campaign_name": campaign_name,
@@ -74,117 +99,157 @@ class OutreachOrchestrator:
                 "successful_calls": 0,
                 "failed_calls": 0,
                 "emails_sent": 0,
-                "interactions": []
+                "interactions": [],
             }
-            
-            # Process each customer
+
             for customer_id in customer_ids:
-                interaction = self.execute_customer_outreach(customer_id)
-                
-                if interaction:
-                    results["interactions"].append(interaction)
-                    
-                    if interaction.get("call_successful"):
-                        results["successful_calls"] += 1
-                    else:
-                        results["failed_calls"] += 1
-                    
-                    if interaction.get("email_sent"):
-                        results["emails_sent"] += 1
-            
-            # Log campaign metrics
+                interaction = self.execute_customer_outreach(customer_id, campaign_id=campaign_id)
+                if not interaction:
+                    results["failed_calls"] += 1
+                    continue
+
+                results["interactions"].append(interaction)
+                if interaction.get("call_successful"):
+                    results["successful_calls"] += 1
+                else:
+                    results["failed_calls"] += 1
+                if interaction.get("email_sent"):
+                    results["emails_sent"] += 1
+
             self.analytics.log_outreach_metrics(
                 campaign_id,
                 calls_initiated=len(customer_ids),
                 calls_completed=results["successful_calls"],
-                emails_sent=results["emails_sent"]
+                emails_sent=results["emails_sent"],
+                customer_satisfaction=self._average_satisfaction(results["interactions"]),
             )
-            
-            self.logger.info(f"Outreach workflow completed for campaign {campaign_id}")
+            self.repository.update_campaign_totals(
+                campaign_id,
+                total_customers=results["total_customers"],
+                successful_calls=results["successful_calls"],
+                failed_calls=results["failed_calls"],
+                emails_sent=results["emails_sent"],
+                end_date=datetime.utcnow(),
+            )
+
+            self.logger.info(
+                "Campaign %s finished: %s/%s calls successful, %s emails sent",
+                campaign_id,
+                results["successful_calls"],
+                results["total_customers"],
+                results["emails_sent"],
+            )
             return results
-        except Exception as e:
-            self.logger.error(f"Error executing outreach workflow: {str(e)}")
+        except Exception as exc:
+            self.logger.error("Error executing outreach workflow: %s", exc, exc_info=True)
             return None
-    
-    def execute_customer_outreach(self, customer_id: int) -> dict:
-        """
-        Execute outreach workflow for a single customer
-        
-        Args:
-            customer_id: ID of customer to contact
-            
-        Returns:
-            Interaction results
+
+    def execute_customer_outreach(self, customer_id: int, campaign_id: int = None) -> dict:
+        """Run the full pipeline for one customer.
+
+        A failed call does not abort the interaction: the decision agent still
+        scores it and the email agent still sends the appropriate follow-up.
         """
         try:
-            self.logger.info(f"Executing outreach for customer {customer_id}")
-            
-            # Step 1: Get customer context
+            self.logger.info("Executing outreach for customer %s", customer_id)
+
             customer_context = self.customer_workflow.get_customer_context(customer_id)
             if not customer_context:
-                self.logger.warning(f"Could not retrieve context for customer {customer_id}")
+                self.logger.warning("Could not retrieve context for customer %s", customer_id)
                 return None
-            
-            # Step 2: Generate call guidance
+
             call_guidance = self.insight_agent.generate_call_guidance(customer_context)
             if not call_guidance:
-                self.logger.warning(f"Could not generate guidance for customer {customer_id}")
+                self.logger.warning("Could not generate guidance for customer %s", customer_id)
                 return None
-            
-            # Step 3: Initiate call
+
+            call_record_id = self.repository.create_call_record(
+                customer_id=customer_id, campaign_id=campaign_id, status=CallStatus.SCHEDULED
+            )
+
             call_details = self.call_agent.initiate_call(customer_context, call_guidance)
-            if not call_details:
-                self.logger.warning(f"Could not initiate call for customer {customer_id}")
-                return None
-            
-            # Step 4: Monitor call (in production, would be async)
-            # call_status = self.call_agent.monitor_call(call_details["call_id"])
-            
-            # Step 5: Analyze call outcome
-            call_analysis = self.decision_agent.analyze_call_outcome(call_details)
-            
-            # Step 6: Send follow-up email
-            email_draft = self.email_agent.draft_followup_email(customer_context, call_analysis)
-            email_sent = False
-            
-            if email_draft:
-                message_id = self.email_agent.send_email(
-                    email_draft["customer_email"],
-                    email_draft["subject"],
-                    email_draft["body"]
+
+            if call_details:
+                self.repository.update_call_record(
+                    call_record_id,
+                    status=CallStatus.IN_PROGRESS,
+                    twilio_call_sid=call_details.get("call_sid"),
+                    call_guid=call_details.get("conversation_id"),
                 )
-                email_sent = message_id is not None
-                
-                # Log email
-                if email_sent:
-                    self.email_agent.log_email(
-                        customer_id,
-                        call_details.get("call_id"),
-                        email_draft["subject"],
-                        email_draft["body"],
-                        message_id
-                    )
-            
+                outcome = self.call_agent.await_outcome(call_details)
+            else:
+                # No call was placed; fall back to email-only outreach.
+                self.logger.warning("Call could not be placed for customer %s", customer_id)
+                self.repository.update_call_record(call_record_id, status=CallStatus.FAILED)
+                outcome = {
+                    "call_id": None,
+                    "customer_id": customer_id,
+                    "status": "failed",
+                    "duration": 0,
+                }
+
+            outcome.setdefault("customer_id", customer_id)
+            outcome["engagement_score"] = customer_context.get("engagement_score", 0)
+
+            call_analysis = self.decision_agent.analyze_call_outcome(outcome)
+            self.decision_agent.log_decision(call_record_id, call_analysis)
+            self.repository.update_call_record(
+                call_record_id,
+                call_transcript=outcome.get("transcript"),
+                audio_url=outcome.get("audio_url"),
+            )
+
+            email_result = self.email_agent.send_followup(
+                customer_context,
+                call_analysis,
+                call_record_id=call_record_id,
+                campaign_id=campaign_id,
+            )
+
             result = {
                 "customer_id": customer_id,
                 "customer_name": customer_context.get("name"),
-                "call_id": call_details.get("call_id"),
-                "call_successful": call_details.get("status") == "in_progress",
-                "email_sent": email_sent,
+                "call_record_id": call_record_id,
+                "call_id": outcome.get("call_id"),
+                "conversation_id": outcome.get("conversation_id"),
+                "call_status": outcome.get("status"),
+                "call_successful": (call_analysis.get("success_indicator") or {}).get("successful", False),
+                "success_score": (call_analysis.get("success_indicator") or {}).get("success_score", 0),
+                "sentiment": (call_analysis.get("sentiment_analysis") or {}).get("overall"),
+                "email_sent": email_result.get("sent", False),
+                "email_subject": email_result.get("subject"),
                 "analysis": call_analysis,
-                "next_action": call_analysis.get("next_action")
+                "next_action": call_analysis.get("next_action"),
             }
-            
-            self.logger.info(f"Outreach completed for customer {customer_id}")
+
+            self.logger.info(
+                "Outreach completed for customer %s (score=%s, email_sent=%s)",
+                customer_id,
+                result["success_score"],
+                result["email_sent"],
+            )
             return result
-        except Exception as e:
-            self.logger.error(f"Error executing customer outreach: {str(e)}")
+        except Exception as exc:
+            self.logger.error("Error executing outreach for customer %s: %s", customer_id, exc, exc_info=True)
             return None
-    
+
+    # ----------------------------------------------------------------- reports
+    @staticmethod
+    def _average_satisfaction(interactions: list) -> float:
+        """Map success scores onto a 0-5 satisfaction proxy."""
+        scores = [i.get("success_score", 0) for i in interactions or []]
+        if not scores:
+            return 0.0
+        return round(sum(scores) / len(scores) / 20, 2)
+
     def get_campaign_metrics(self, campaign_id: int) -> dict:
         """Get detailed metrics for a campaign"""
         return self.analytics.get_campaign_metrics(campaign_id)
-    
+
     def get_performance_summary(self, days: int = 30) -> dict:
         """Get performance summary for the period"""
         return self.analytics.get_performance_summary(days=days)
+
+    def close(self):
+        """Release the database connection pool."""
+        self.db_manager.close()
