@@ -47,8 +47,10 @@ Outreach agent/
 │   └── config.yaml             # Configuration file
 ├── scripts/
 │   └── seed_data.py            # Sample data creation
+├── tests/                      # Offline test suite (pytest)
 ├── main.py                     # Entry point
 ├── requirements.txt            # Dependencies
+├── requirements-dev.txt        # Test dependencies
 └── .env.example                # Environment variables template
 ```
 
@@ -160,6 +162,17 @@ python main.py
 ```bash
 python scripts/seed_data.py
 ```
+
+## Running the Tests
+
+```bash
+pip install -r requirements-dev.txt
+pytest
+```
+
+The suite runs entirely offline: every test forces `DRY_RUN=true`, uses a
+temporary SQLite database and a fake HTTP session, so no test can place a call,
+send an email or reach an external API.
 
 ## Database Models
 

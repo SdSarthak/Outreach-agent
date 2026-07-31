@@ -25,14 +25,15 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_CONFIG_PATH = PROJECT_ROOT / "config" / "config.yaml"
 
 _TRUE_VALUES = {"1", "true", "yes", "on"}
-_FALSE_VALUES = {"0", "false", "no", "off", ""}
+_FALSE_VALUES = {"0", "false", "no", "off"}
 
 
 def _env_bool(name: str, default: bool = False) -> bool:
     raw = os.getenv(name)
-    if raw is None or raw == "":
+    value = "" if raw is None else raw.strip().lower()
+    if not value:
+        # Unset or blank means "not configured", never "false".
         return default
-    value = raw.strip().lower()
     if value not in _TRUE_VALUES and value not in _FALSE_VALUES:
         # A typo such as DRY_RUN=ture must not silently arm live calls.
         logger.warning("%s=%r is not a boolean - using %s", name, raw, default)

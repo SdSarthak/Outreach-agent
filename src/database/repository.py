@@ -130,6 +130,8 @@ class OutreachRepository:
             return False
 
     def get_call_record(self, call_record_id: int) -> Optional[dict]:
+        if not call_record_id:
+            return None
         with self.db.session_scope() as session:
             record = session.get(CallRecord, call_record_id)
             if not record:
@@ -183,6 +185,8 @@ class OutreachRepository:
             return None
 
     def update_email_status(self, email_record_id: int, status, message_id: str = None) -> bool:
+        if not email_record_id:
+            return False
         try:
             with self.db.session_scope() as session:
                 record = session.get(EmailRecord, email_record_id)

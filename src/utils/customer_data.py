@@ -20,6 +20,9 @@ class CustomerDataWorkflow:
 
         Returns None when the customer does not exist.
         """
+        if not customer_id:
+            logger.warning("Cannot load a customer context without an id")
+            return None
         try:
             with self.db.session_scope() as session:
                 customer = session.get(Customer, customer_id)
