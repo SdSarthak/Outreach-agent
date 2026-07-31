@@ -15,8 +15,19 @@ from src.utils import setup_logging  # noqa: E402
 logger = logging.getLogger(__name__)
 
 
+def _positive_int(raw: str) -> int:
+    """argparse type for options that are meaningless at zero or below."""
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        raise argparse.ArgumentTypeError(f"expected an integer, got {raw!r}")
+    if value < 1:
+        raise argparse.ArgumentTypeError(f"expected a positive integer, got {value}")
+    return value
+
+
 def _parse_customer_ids(raw: str) -> list:
-    """Parse a comma separated list of customer ids."""
+    """Parse a comma separated list of customer ids, preserving order."""
     if not raw:
         return []
     ids = []
@@ -25,9 +36,13 @@ def _parse_customer_ids(raw: str) -> list:
         if not chunk:
             continue
         try:
-            ids.append(int(chunk))
+            value = int(chunk)
         except ValueError:
             raise SystemExit(f"Invalid customer id: {chunk!r}")
+        if value < 1:
+            raise SystemExit(f"Invalid customer id: {value} (ids start at 1)")
+        if value not in ids:
+            ids.append(value)
     return ids
 
 
@@ -174,25 +189,25 @@ def build_parser() -> argparse.ArgumentParser:
     run = subparsers.add_parser("run", help="execute an outreach campaign")
     run.add_argument("--customers", help="comma separated customer ids (default: all active)")
     run.add_argument("--campaign", help="campaign name")
-    run.add_argument("--limit", type=int, help="max customers to contact")
-    run.add_argument("--days", type=int, default=30, help="performance summary window")
+    run.add_argument("--limit", type=_positive_int, help="max customers to contact")
+    run.add_argument("--days", type=_positive_int, default=30, help="performance summary window")
     run.set_defaults(func=command_run)
 
     seed = subparsers.add_parser("seed", help="populate the database with sample data")
     seed.add_argument("--reset", action="store_true", help="drop existing tables first")
-    seed.add_argument("--customers", type=int, default=5, help="number of sample customers")
+    seed.add_argument("--customers", type=_positive_int, default=5, help="number of sample customers")
     seed.set_defaults(func=command_seed)
 
     init = subparsers.add_parser("init-db", help="create the database schema")
     init.set_defaults(func=command_init_db)
 
     customers = subparsers.add_parser("customers", help="list stored customers")
-    customers.add_argument("--limit", type=int, help="max rows to show")
+    customers.add_argument("--limit", type=_positive_int, help="max rows to show")
     customers.set_defaults(func=command_customers)
 
     report = subparsers.add_parser("report", help="show campaign or period metrics")
-    report.add_argument("--campaign", type=int, help="campaign id")
-    report.add_argument("--days", type=int, default=30, help="summary window in days")
+    report.add_argument("--campaign", type=_positive_int, help="campaign id")
+    report.add_argument("--days", type=_positive_int, default=30, help="summary window in days")
     report.set_defaults(func=command_report)
 
     authorize = subparsers.add_parser("authorize-gmail", help="run the Gmail OAuth flow once")
