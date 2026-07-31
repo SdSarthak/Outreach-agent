@@ -125,6 +125,31 @@ def test_analyze_survives_an_empty_outcome(agent):
     assert analysis["next_action"] == "Send personalized follow-up email"
 
 
+@pytest.mark.parametrize(
+    "duration,expected",
+    [("168", 168), (168.9, 168), (None, 0), ("n/a", 0), (True, 0), (-5, 0), ([], 0)],
+)
+def test_durations_from_providers_are_coerced(agent, duration, expected):
+    analysis = agent.analyze_call_outcome({"status": "completed", "duration": duration})
+    assert analysis["duration"] == expected
+
+
+def test_a_string_duration_still_scores_the_call(agent):
+    assert agent._assess_success({"status": "completed", "duration": "150"})["success_score"] == 70
+
+
+def test_a_non_string_transcript_does_not_crash(agent):
+    sentiment = agent._analyze_sentiment({"transcript": ["User: excellent"]})
+    assert sentiment["overall"] == "positive"
+
+
+def test_a_non_numeric_engagement_score_does_not_crash(agent):
+    analysis = agent.analyze_call_outcome(
+        {"status": "completed", "duration": 168, "customer_engaged": True, "engagement_score": "high"}
+    )
+    assert analysis["priority_level"] == "medium"
+
+
 def test_key_phrases_are_the_longest_sentences(agent):
     phrases = agent._extract_key_phrases(TRANSCRIPT)
     assert len(phrases) <= 3

@@ -18,6 +18,22 @@ NEGATIVE_TERMS = (
 )
 
 
+def _duration_seconds(call_data: dict) -> int:
+    """Call duration as a whole number of seconds.
+
+    Providers report duration as an int, a float or a numeric string depending
+    on the endpoint, and a TypeError here would discard the whole interaction.
+    """
+    value = call_data.get("duration")
+    if value is None or isinstance(value, bool):
+        return 0
+    try:
+        return max(0, int(float(value)))
+    except (TypeError, ValueError):
+        logger.warning("Ignoring unusable call duration %r", value)
+        return 0
+
+
 class DecisionAgent:
     """Scores a call and recommends the next action."""
 
@@ -51,7 +67,7 @@ class DecisionAgent:
             "conversation_id": call_data.get("conversation_id"),
             "customer_id": call_data.get("customer_id"),
             "call_status": call_data.get("status"),
-            "duration": call_data.get("duration", 0),
+            "duration": _duration_seconds(call_data),
             "sentiment_analysis": sentiment,
             "success_indicator": success,
             "follow_up_recommendation": recommendation,
@@ -71,6 +87,8 @@ class DecisionAgent:
     def _analyze_sentiment(self, call_data: dict) -> dict:
         """Keyword-based sentiment read of the customer's turns."""
         transcript = call_data.get("transcript") or ""
+        if not isinstance(transcript, str):
+            transcript = str(transcript)
         customer_speech = self._customer_speech(transcript).lower()
 
         positives = sum(1 for term in POSITIVE_TERMS if term in customer_speech)
@@ -98,7 +116,7 @@ class DecisionAgent:
     def _assess_success(self, call_data: dict) -> dict:
         """Score the call out of 100 from status, duration and engagement."""
         status = str(call_data.get("status", "unknown")).lower()
-        duration = call_data.get("duration") or 0
+        duration = _duration_seconds(call_data)
         score = 0
         indicators = []
 
@@ -170,9 +188,11 @@ class DecisionAgent:
         success = success or self._assess_success(call_data)
         if not success.get("successful"):
             return "high"
-        if (call_data.get("engagement_score") or 0) > 0.7:
-            return "high"
-        return "medium"
+        try:
+            engagement = float(call_data.get("engagement_score") or 0)
+        except (TypeError, ValueError):
+            engagement = 0.0
+        return "high" if engagement > 0.7 else "medium"
 
     # -------------------------------------------------------------- transcript
     @staticmethod
