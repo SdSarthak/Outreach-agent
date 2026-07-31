@@ -7,6 +7,29 @@ from src.agents.base import build_agent
 logger = logging.getLogger(__name__)
 
 
+def _engagement_score(context: dict) -> float:
+    """Engagement score as a float, tolerating missing or non-numeric values."""
+    try:
+        return float(context.get("engagement_score") or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _dicts(context: dict, key: str) -> list:
+    """Return the dict entries stored under ``key``, ignoring anything else.
+
+    Context can come straight from the database (where nullable columns show up
+    as ``None``) or from a caller passing a hand-built payload, so every list
+    read here has to survive both.
+    """
+    values = context.get(key) or []
+    if isinstance(values, dict):
+        values = [values]
+    if not isinstance(values, (list, tuple)):
+        return []
+    return [value for value in values if isinstance(value, dict)]
+
+
 class InsightAgent:
     """Agent for generating strategic call guidance and insights"""
 
@@ -32,7 +55,7 @@ class InsightAgent:
         Returns:
             Call guidance with talking points and recommendations
         """
-        if not customer_context:
+        if not customer_context or not isinstance(customer_context, dict):
             logger.warning("Cannot generate guidance without customer context")
             return None
 
@@ -60,26 +83,25 @@ class InsightAgent:
             points.append(f"Discuss industry trends in {context['industry']}")
         
         # Engagement-based points
-        if context.get("engagement_score", 0) > 0.7:
+        if _engagement_score(context) > 0.7:
             points.append("Leverage high engagement history to deepen relationship")
-        
+
         # Product/service points
-        products = [e.get("product") for e in context.get("enrollments") or [] if e.get("product")]
+        products = [str(e.get("product")) for e in _dicts(context, "enrollments") if e.get("product")]
         if products:
             points.append(f"Reference their current products: {', '.join(sorted(set(products)))}")
-        
+
         # Feedback-based points
-        if context.get("feedback_history"):
-            sentiments = [f.get("sentiment") for f in context["feedback_history"]]
-            if "positive" in sentiments:
-                points.append("Acknowledge positive feedback and build on successful areas")
-        
+        sentiments = [f.get("sentiment") for f in _dicts(context, "feedback_history")]
+        if "positive" in sentiments:
+            points.append("Acknowledge positive feedback and build on successful areas")
+
         return points if points else ["Build rapport and understand customer needs"]
-    
+
     def _determine_tone(self, context: dict) -> str:
         """Determine appropriate communication tone"""
-        engagement = context.get("engagement_score", 0)
-        
+        engagement = _engagement_score(context)
+
         if engagement > 0.8:
             return "collaborative and partnership-focused"
         elif engagement > 0.5:
@@ -90,14 +112,14 @@ class InsightAgent:
     def _recommend_actions(self, context: dict) -> list:
         """Recommend actions based on context"""
         actions = []
-        
-        if context.get("engagement_score", 0) > 0.6:
+
+        if _engagement_score(context) > 0.6:
             actions.append("Schedule follow-up meeting")
-        
+
         if not context.get("enrollments"):
             actions.append("Introduce key products/services")
-        
-        feedback_history = context.get("feedback_history") or []
+
+        feedback_history = _dicts(context, "feedback_history")
         recent_feedback = feedback_history[0] if feedback_history else {}
         if recent_feedback.get("sentiment") == "negative":
             actions.append("Address concerns and offer solutions")
@@ -106,14 +128,14 @@ class InsightAgent:
     
     def _strategy_for_engagement(self, context: dict) -> str:
         """Determine engagement strategy"""
-        recent_engagements = context.get("recent_engagements", [])
-        
+        recent_engagements = _dicts(context, "recent_engagements")
+
         if not recent_engagements:
             return "Re-engagement strategy: Reconnect and understand current situation"
-        
-        recent_engagement = recent_engagements[0]
-        engagement_type = recent_engagement.get("type", "").lower()
-        
+
+        # `engagement_type` is nullable in the database, so it can arrive as None.
+        engagement_type = str(recent_engagements[0].get("type") or "").lower()
+
         if "support" in engagement_type:
             return "Support expansion: Help resolve issues and introduce related services"
         elif "feature_usage" in engagement_type:
@@ -126,7 +148,7 @@ class InsightAgent:
         objections = []
         
         # `CustomerDataWorkflow` exposes the feedback body under "text".
-        for f in context.get("feedback_history") or []:
+        for f in _dicts(context, "feedback_history"):
             if f.get("sentiment") == "negative":
                 concern = f.get("text") or f.get("feedback_text")
                 if concern:

@@ -1,6 +1,7 @@
 """Agent that drafts and sends personalized follow-up emails."""
 
 import logging
+import re
 
 from src.agents.base import build_agent
 from src.config import get_settings
@@ -8,6 +9,14 @@ from src.database import EmailStatus, OutreachRepository
 from src.integrations import GmailIntegration
 
 logger = logging.getLogger(__name__)
+
+# Deliberately permissive: this only rejects addresses that Gmail would reject
+# outright (no local part, no domain, whitespace or a stray header separator).
+_ADDRESS_RE = re.compile(r"^[^@\s,;:<>]+@[^@\s,;:<>]+\.[^@\s,;:<>]+$")
+
+
+def _is_plausible_address(address: str) -> bool:
+    return bool(_ADDRESS_RE.match(address))
 
 
 class EmailAgent:
@@ -41,9 +50,18 @@ class EmailAgent:
         customer_data = customer_data or {}
         call_analysis = call_analysis or {}
 
-        if not customer_data.get("email"):
+        recipient = str(customer_data.get("email") or "").strip()
+        if not recipient:
             logger.warning("Customer %s has no email address", customer_data.get("customer_id"))
             return None
+        if not _is_plausible_address(recipient):
+            logger.warning(
+                "Customer %s has a malformed email address %r - skipping follow-up",
+                customer_data.get("customer_id"),
+                recipient,
+            )
+            return None
+        customer_data = {**customer_data, "email": recipient}
 
         email_type = (call_analysis.get("follow_up_recommendation") or {}).get("type")
         builders = {
@@ -59,11 +77,14 @@ class EmailAgent:
         )
         return email
 
-    def _base_fields(self, customer_data: dict) -> tuple:
-        name = customer_data.get("name") or "there"
-        first_name = name.split()[0]
-        company = customer_data.get("company") or "your organization"
-        return name, first_name, company
+    @staticmethod
+    def _base_fields(customer_data: dict) -> tuple:
+        """Greeting fields, tolerating blank or whitespace-only names."""
+        name = str(customer_data.get("name") or "").strip()
+        parts = name.split()
+        first_name = parts[0] if parts else "there"
+        company = str(customer_data.get("company") or "").strip() or "your organization"
+        return name or "there", first_name, company
 
     def _envelope(self, customer_data: dict, subject: str, body: str, email_type: str) -> dict:
         return {
@@ -179,6 +200,10 @@ class EmailAgent:
         """Persist an email record. Returns its id, or None without a database."""
         if not self.repository:
             logger.debug("No repository configured - email not persisted")
+            return None
+        if not customer_id:
+            # `customer_id` is NOT NULL; without it the insert can only fail.
+            logger.warning("Email to %r has no customer id - not persisted", subject)
             return None
 
         return self.repository.create_email_record(
