@@ -84,6 +84,14 @@ class OutreachOrchestrator:
                 campaign_name,
                 description=f"Outreach campaign for {len(customer_ids)} customers",
             )
+            if not campaign_id:
+                # Without a campaign row nothing can be attributed or reported,
+                # so stop before placing calls rather than losing the results.
+                self.logger.error(
+                    "Could not create campaign '%s' - aborting before any call is placed",
+                    campaign_name,
+                )
+                return None
 
             self.logger.info(
                 "Starting campaign '%s' (%s) for %s customers",
@@ -251,5 +259,20 @@ class OutreachOrchestrator:
         return self.analytics.get_performance_summary(days=days)
 
     def close(self):
-        """Release the database connection pool."""
+        """Release the database pool and every integration's open handles."""
+        for closable in (self.elevenlabs, self.gmail):
+            close = getattr(closable, "close", None)
+            if not callable(close):
+                continue
+            try:
+                close()
+            except Exception as exc:  # pragma: no cover - defensive
+                self.logger.debug("Error closing %s: %s", type(closable).__name__, exc)
         self.db_manager.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self.close()
+        return False

@@ -10,6 +10,7 @@ Import `get_settings()` anywhere in the codebase instead of calling
 `os.getenv` directly so that every module sees the same configuration.
 """
 
+import logging
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -18,27 +19,56 @@ from typing import Any, Optional
 import yaml
 from dotenv import load_dotenv
 
+logger = logging.getLogger(__name__)
+
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_CONFIG_PATH = PROJECT_ROOT / "config" / "config.yaml"
 
 _TRUE_VALUES = {"1", "true", "yes", "on"}
+_FALSE_VALUES = {"0", "false", "no", "off", ""}
 
 
 def _env_bool(name: str, default: bool = False) -> bool:
     raw = os.getenv(name)
     if raw is None or raw == "":
         return default
-    return raw.strip().lower() in _TRUE_VALUES
+    value = raw.strip().lower()
+    if value not in _TRUE_VALUES and value not in _FALSE_VALUES:
+        # A typo such as DRY_RUN=ture must not silently arm live calls.
+        logger.warning("%s=%r is not a boolean - using %s", name, raw, default)
+        return default
+    return value in _TRUE_VALUES
 
 
-def _env_int(name: str, default: int) -> int:
+def _env_int(name: str, default: int, minimum: int = None) -> int:
     raw = os.getenv(name)
     if raw is None or raw == "":
-        return default
+        return _clamp(default, minimum)
     try:
-        return int(raw)
+        return _clamp(int(raw), minimum, name=name)
     except ValueError:
-        return default
+        logger.warning("%s=%r is not an integer - using %s", name, raw, default)
+        return _clamp(default, minimum)
+
+
+def _env_float(name: str, default: float, minimum: float = None) -> float:
+    raw = os.getenv(name)
+    if raw is None or raw == "":
+        return _clamp(default, minimum)
+    try:
+        return _clamp(float(raw), minimum, name=name)
+    except ValueError:
+        logger.warning("%s=%r is not a number - using %s", name, raw, default)
+        return _clamp(default, minimum)
+
+
+def _clamp(value, minimum, name: str = None):
+    """Raise ``value`` to ``minimum``, warning when a setting is out of range."""
+    if minimum is not None and value < minimum:
+        if name:
+            logger.warning("%s=%s is below the minimum %s - using %s", name, value, minimum, minimum)
+        return minimum
+    return value
 
 
 def _resolve_path(value: Optional[str]) -> Optional[str]:
@@ -75,6 +105,9 @@ class Settings:
     openai_api_key: Optional[str] = None
     openai_model: str = "gpt-4o"
     openai_timeout: int = 30
+
+    # HTTP
+    http_timeout: int = 30
 
     # ElevenLabs
     elevenlabs_api_key: Optional[str] = None
@@ -143,17 +176,54 @@ class Settings:
 
 
 def load_config(config_path: Optional[str] = None) -> dict:
-    """Load the YAML configuration file, returning {} when unavailable."""
+    """Load the YAML configuration file, returning {} when unavailable.
+
+    A missing file is normal (defaults apply), but a file that exists and
+    cannot be parsed is reported: silently ignoring it would hide the fact
+    that none of the operator's settings took effect.
+    """
     path = Path(config_path) if config_path else DEFAULT_CONFIG_PATH
     if not path.is_absolute():
         path = PROJECT_ROOT / path
     try:
         with open(path, "r", encoding="utf-8") as handle:
-            return yaml.safe_load(handle) or {}
+            loaded = yaml.safe_load(handle)
     except FileNotFoundError:
+        if config_path:
+            logger.warning("Config file %s not found - using defaults", path)
         return {}
-    except yaml.YAMLError:
+    except (OSError, UnicodeDecodeError) as exc:
+        logger.warning("Could not read config file %s: %s - using defaults", path, exc)
         return {}
+    except yaml.YAMLError as exc:
+        logger.error("Config file %s is not valid YAML: %s - using defaults", path, exc)
+        return {}
+
+    if loaded is None:
+        return {}
+    if not isinstance(loaded, dict):
+        logger.error(
+            "Config file %s must contain a mapping, got %s - using defaults",
+            path,
+            type(loaded).__name__,
+        )
+        return {}
+    return loaded
+
+
+def _cfg_int(section: dict, key: str, default: int) -> int:
+    """Read an integer from a config section without trusting its contents."""
+    value = section.get(key, default) if isinstance(section, dict) else default
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        logger.warning("config value %s=%r is not an integer - using %s", key, value, default)
+        return default
+
+
+def _cfg_str(section: dict, key: str, default: str) -> str:
+    value = section.get(key, default) if isinstance(section, dict) else default
+    return str(value) if value is not None else default
 
 
 def build_settings(config_path: Optional[str] = None) -> Settings:
@@ -178,12 +248,13 @@ def build_settings(config_path: Optional[str] = None) -> Settings:
         dry_run=_env_bool("DRY_RUN", True),
         database_url=os.getenv("DATABASE_URL", "sqlite:///outreach_agent.db"),
         db_echo=_env_bool("DB_ECHO", bool(database_cfg.get("echo", False))),
-        log_level=os.getenv("LOG_LEVEL", logging_cfg.get("level", "INFO")).upper(),
-        log_file=os.getenv("LOG_FILE", logging_cfg.get("file", "logs/outreach_agent.log")),
+        log_level=str(os.getenv("LOG_LEVEL") or _cfg_str(logging_cfg, "level", "INFO")).upper(),
+        log_file=os.getenv("LOG_FILE") or _cfg_str(logging_cfg, "file", "logs/outreach_agent.log"),
         enable_call_logging=_env_bool("ENABLE_CALL_LOGGING", True),
         openai_api_key=os.getenv("OPENAI_API_KEY") or None,
         openai_model=os.getenv("OPENAI_MODEL_NAME", "gpt-4o"),
-        openai_timeout=_env_int("OPENAI_TIMEOUT", 30),
+        openai_timeout=_env_int("OPENAI_TIMEOUT", 30, minimum=1),
+        http_timeout=_env_int("HTTP_TIMEOUT", 30, minimum=1),
         elevenlabs_api_key=os.getenv("ELEVENLABS_API_KEY") or None,
         elevenlabs_agent_id=os.getenv("ELEVENLABS_AGENT_ID") or None,
         elevenlabs_phone_number_id=os.getenv("ELEVENLABS_PHONE_NUMBER_ID") or None,
@@ -197,9 +268,14 @@ def build_settings(config_path: Optional[str] = None) -> Settings:
         gmail_token_path=_resolve_path(os.getenv("GMAIL_TOKEN_PATH", "token.json")),
         sender_name=gmail_cfg.get("sender_name", "AI Outreach Agent"),
         email_signature=gmail_cfg.get("signature", "Best regards,\nAI Outreach Team"),
-        call_poll_interval=_env_int("CALL_POLL_INTERVAL", int(calls_cfg.get("poll_interval", 5))),
-        call_max_wait=_env_int("CALL_MAX_WAIT", int(calls_cfg.get("max_wait_seconds", 120))),
-        retry_attempts=_env_int("RETRY_ATTEMPTS", 3),
+        call_poll_interval=_env_int(
+            "CALL_POLL_INTERVAL", _cfg_int(calls_cfg, "poll_interval", 5), minimum=1
+        ),
+        call_max_wait=_env_int(
+            "CALL_MAX_WAIT", _cfg_int(calls_cfg, "max_wait_seconds", 120), minimum=0
+        ),
+        retry_attempts=_env_int("RETRY_ATTEMPTS", 3, minimum=1),
+        retry_backoff=_env_float("RETRY_BACKOFF", 1.5, minimum=1.0),
     )
 
 

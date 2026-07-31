@@ -204,6 +204,16 @@ class GmailIntegration:
             logger.error("Error sending email to %s: %s", to_email, exc)
             return None
 
+    def close(self) -> None:
+        """Release the Gmail API client's pooled HTTP connections."""
+        service, self.service = self.service, None
+        close = getattr(service, "close", None)
+        if callable(close):
+            try:
+                close()
+            except Exception as exc:  # pragma: no cover - defensive
+                logger.debug("Error closing Gmail service: %s", exc)
+
     # ---------------------------------------------------------------- templates
     def get_email_templates(self) -> dict:
         """Predefined email templates, overridable from config.yaml."""

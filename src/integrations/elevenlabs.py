@@ -21,9 +21,39 @@ from src.config import Settings, get_settings
 
 logger = logging.getLogger(__name__)
 
+#: Methods that can be replayed safely. Everything else (notably the outbound
+#: call endpoint) must not be retried on an ambiguous failure: the request may
+#: already have dialled the customer.
+IDEMPOTENT_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
+
+#: Never wait longer than this for a server supplied `Retry-After`.
+MAX_RETRY_AFTER_SECONDS = 30
+
 
 class ElevenLabsError(RuntimeError):
     """Raised when the ElevenLabs API returns an unrecoverable error."""
+
+
+def _safe_int(value, default: int = 0) -> int:
+    """Coerce an API-supplied value to int without raising on junk input."""
+    if value is None or isinstance(value, bool):
+        return default
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
+        return default
+
+
+def _retry_after_seconds(response) -> Optional[float]:
+    """Parse a `Retry-After` header expressed in seconds, if present."""
+    raw = (response.headers or {}).get("Retry-After") if response is not None else None
+    if not raw:
+        return None
+    try:
+        return max(0.0, min(float(str(raw).strip()), MAX_RETRY_AFTER_SECONDS))
+    except (TypeError, ValueError):
+        # The HTTP-date form is legal but rare; fall back to normal backoff.
+        return None
 
 
 class ElevenLabsIntegration:
@@ -56,44 +86,85 @@ class ElevenLabsIntegration:
         return {"xi-api-key": self.api_key or "", "Content-Type": "application/json"}
 
     def _request(self, method: str, path: str, **kwargs) -> dict:
-        """Issue an API request, retrying transient failures with backoff."""
+        """Issue an API request, retrying transient failures with backoff.
+
+        Only requests that are safe to replay are retried after an ambiguous
+        failure (a connection error or a 5xx): a POST that starts an outbound
+        call may already have reached the customer's phone, so replaying it
+        would dial them twice. HTTP 429 is always retryable because the request
+        provably was not processed.
+        """
+        method = str(method).upper()
+        replayable = method in IDEMPOTENT_METHODS
         url = f"{self.base_url}{path}"
         attempts = max(1, self.settings.retry_attempts)
-        backoff = self.settings.retry_backoff
+        backoff = max(1.0, float(self.settings.retry_backoff or 1.0))
         last_error = None
 
         for attempt in range(1, attempts + 1):
+            delay = None
             try:
                 response = self.session.request(
                     method,
                     url,
                     headers=self._headers(),
-                    timeout=self.settings.openai_timeout,
+                    timeout=self.settings.http_timeout,
                     **kwargs,
                 )
             except requests.RequestException as exc:
+                if not replayable:
+                    raise ElevenLabsError(
+                        f"ElevenLabs {method} {path} failed: {exc}"
+                    ) from exc
                 last_error = exc
                 logger.warning("ElevenLabs %s %s failed (attempt %s): %s", method, path, attempt, exc)
             else:
                 if response.status_code < 400:
                     try:
-                        return response.json()
+                        payload = response.json()
                     except ValueError:
                         return {}
-                # 4xx other than rate limiting will not succeed on retry.
-                if response.status_code < 500 and response.status_code != 429:
+                    # A list or scalar body would break every caller's `.get`.
+                    return payload if isinstance(payload, dict) else {}
+
+                if response.status_code == 429:
+                    delay = _retry_after_seconds(response)
+                elif response.status_code < 500 or not replayable:
+                    # Client errors never succeed on retry, and a 5xx on a
+                    # non-replayable request may still have taken effect.
                     raise ElevenLabsError(
                         f"ElevenLabs {method} {path} returned {response.status_code}: {response.text[:300]}"
                     )
+
                 last_error = ElevenLabsError(
                     f"ElevenLabs {method} {path} returned {response.status_code}"
                 )
-                logger.warning("ElevenLabs %s %s transient error (attempt %s)", method, path, attempt)
+                logger.warning(
+                    "ElevenLabs %s %s transient error %s (attempt %s)",
+                    method,
+                    path,
+                    response.status_code,
+                    attempt,
+                )
 
             if attempt < attempts:
-                time.sleep(backoff ** attempt)
+                time.sleep(backoff ** attempt if delay is None else delay)
 
         raise ElevenLabsError(f"ElevenLabs {method} {path} failed after {attempts} attempts: {last_error}")
+
+    def close(self) -> None:
+        """Close the underlying HTTP session and its pooled sockets."""
+        try:
+            self.session.close()
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.debug("Error closing ElevenLabs session: %s", exc)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self.close()
+        return False
 
     # ------------------------------------------------------------------ context
     def inject_context_variables(self, context: dict) -> dict:
@@ -209,9 +280,9 @@ class ElevenLabsIntegration:
         """
         max_wait = self.settings.call_max_wait if max_wait is None else max_wait
         poll_interval = self.settings.call_poll_interval if poll_interval is None else poll_interval
-        poll_interval = max(1, poll_interval)
+        poll_interval = max(1, _safe_int(poll_interval, 5))
 
-        deadline = time.monotonic() + max(0, max_wait)
+        deadline = time.monotonic() + max(0, _safe_int(max_wait))
         data = self.get_conversation(conversation_id)
 
         while data.get("status") in {"processing", "in-progress", "initiated"}:
@@ -269,15 +340,17 @@ class ElevenLabsIntegration:
                 "error": str(exc),
             }
 
-        metadata = payload.get("metadata") or {}
-        analysis = payload.get("analysis") or {}
+        metadata = payload.get("metadata")
+        metadata = metadata if isinstance(metadata, dict) else {}
+        analysis = payload.get("analysis")
+        analysis = analysis if isinstance(analysis, dict) else {}
         transcript = self.flatten_transcript(payload)
 
         return {
             "conversation_id": conversation_id,
             "status": payload.get("status", "unknown"),
             "transcript": transcript or None,
-            "duration_seconds": int(metadata.get("call_duration_secs") or 0),
+            "duration_seconds": _safe_int(metadata.get("call_duration_secs")),
             "audio_url": metadata.get("recording_url"),
             "call_successful": analysis.get("call_successful"),
             "summary": analysis.get("transcript_summary"),
